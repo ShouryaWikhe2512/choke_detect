@@ -22,7 +22,8 @@ from ultralytics import YOLO
 
 
 # COCO vehicle and signal classes on YOLOv8 COCO model
-VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
+# Include two-wheelers explicitly for mixed-traffic analysis.
+VEHICLE_CLASS_IDS = {1, 2, 3, 5, 7}  # bicycle, car, motorcycle, bus, truck
 TRAFFIC_SIGNAL_CLASS_IDS = {9, 11}  # traffic light, stop sign
 
 
@@ -53,8 +54,13 @@ def run_yolo_vehicles(model: YOLO, img_bgr: np.ndarray, conf_threshold: float = 
     for i in range(len(boxes)):
         cls_id = int(boxes.cls[i].item())
         conf = float(boxes.conf[i].item())
-        if conf < conf_threshold:
-            continue
+        if cls_id in TRAFFIC_SIGNAL_CLASS_IDS:
+            # Allow lower threshold for signals; we will refine with NMS separately.
+            if conf < min(0.15, conf_threshold):
+                continue
+        else:
+            if conf < conf_threshold:
+                continue
         if cls_id not in VEHICLE_CLASS_IDS and cls_id not in TRAFFIC_SIGNAL_CLASS_IDS:
             continue
         x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
@@ -75,6 +81,86 @@ def split_vehicle_and_signal_detections(detections):
     vehicles = [d for d in detections if d["class_id"] in VEHICLE_CLASS_IDS]
     signals = [d for d in detections if d["class_id"] in TRAFFIC_SIGNAL_CLASS_IDS]
     return vehicles, signals
+
+
+def _nms_boxes(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float = 0.5):
+    """Simple class-agnostic NMS for traffic signal boxes."""
+    if boxes.size == 0:
+        return []
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+        inds = np.where(ovr <= iou_thresh)[0]
+        order = order[inds + 1]
+
+    return keep
+
+
+def detect_traffic_signals_multi_scale(model: YOLO, img_bgr: np.ndarray):
+    """
+    Enhance traffic signal detection with simple multi-scale inference and NMS.
+    Returns (signal_detected, signal_confidence).
+    """
+    scales = [1.0, 1.5, 2.0]
+    all_boxes = []
+    all_scores = []
+
+    for s in scales:
+        if s == 1.0:
+            resized = img_bgr
+        else:
+            resized = cv2.resize(
+                img_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR
+            )
+        res = model(resized, verbose=False, conf=0.1, iou=0.5)[0]
+        if res.boxes is None:
+            continue
+        for i in range(len(res.boxes)):
+            cls_id = int(res.boxes.cls[i].item())
+            if cls_id not in TRAFFIC_SIGNAL_CLASS_IDS:
+                continue
+            conf = float(res.boxes.conf[i].item())
+            if conf < 0.15:
+                continue
+            x1, y1, x2, y2 = res.boxes.xyxy[i].cpu().numpy()
+            # Map back to original scale
+            x1 /= s
+            y1 /= s
+            x2 /= s
+            y2 /= s
+            all_boxes.append([x1, y1, x2, y2])
+            all_scores.append(conf)
+
+    if not all_boxes:
+        return False, 0.0
+
+    boxes_np = np.array(all_boxes, dtype=np.float32)
+    scores_np = np.array(all_scores, dtype=np.float32)
+    keep = _nms_boxes(boxes_np, scores_np, iou_thresh=0.5)
+    if not keep:
+        return False, 0.0
+    final_scores = scores_np[keep]
+    signal_confidence = float(min(1.0, float(final_scores.max())))
+    return True, signal_confidence
 
 
 def detect_lane_lines(img_bgr: np.ndarray):
@@ -117,6 +203,134 @@ def detect_lane_lines(img_bgr: np.ndarray):
     return segments, angles_deg
 
 
+def estimate_vanishing_point(line_segments, img_shape):
+    """
+    Rough vanishing point estimation by clustering intersections of lane lines.
+    Returns (vx, vy) in image coordinates or None if unreliable.
+    """
+    h, w = img_shape[:2]
+    n = len(line_segments)
+    if n < 3:
+        return None
+
+    intersections = []
+
+    def segment_to_line(seg):
+        x1, y1, x2, y2 = seg
+        a = y1 - y2
+        b = x2 - x1
+        c = x1 * y2 - x2 * y1
+        return a, b, c
+
+    lines = [segment_to_line(seg) for seg in line_segments]
+
+    for i in range(n):
+        a1, b1, c1 = lines[i]
+        for j in range(i + 1, n):
+            a2, b2, c2 = lines[j]
+            det = a1 * b2 - a2 * b1
+            if abs(det) < 1e-3:
+                continue
+            x = (b1 * c2 - b2 * c1) / det
+            y = (c1 * a2 - c2 * a1) / det
+            # Only consider intersections in front of camera (upper half-ish)
+            if -0.25 * w <= x <= 1.25 * w and -0.25 * h <= y <= h * 1.0:
+                intersections.append((x, y))
+
+    if len(intersections) < 4:
+        return None
+
+    pts = np.array(intersections, dtype=np.float32)
+    # Cluster intersections into one or two groups, keep main centroid
+    k = 2 if len(intersections) >= 8 else 1
+    kmeans = KMeans(n_clusters=k, random_state=0, n_init=10)
+    labels = kmeans.fit_predict(pts)
+    counts = [np.sum(labels == i) for i in range(k)]
+    main_cluster = int(np.argmax(counts))
+    vp = pts[labels == main_cluster].mean(axis=0)
+    return float(vp[0]), float(vp[1])
+
+
+def compute_birds_eye_view(img_bgr: np.ndarray):
+    """
+    Simple bird's-eye approximation using a fixed trapezoidal source region.
+    Used for stop-line and zebra detection.
+    """
+    h, w = img_bgr.shape[:2]
+    src = np.float32(
+        [
+            [w * 0.2, h * 0.7],
+            [w * 0.8, h * 0.7],
+            [w * 0.1, h * 0.98],
+            [w * 0.9, h * 0.98],
+        ]
+    )
+    dst_w = w
+    dst_h = int(h * 0.6)
+    dst = np.float32([[0, 0], [dst_w, 0], [0, dst_h], [dst_w, dst_h]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    bird = cv2.warpPerspective(img_bgr, M, (dst_w, dst_h))
+    return bird, M
+
+
+def detect_stop_line(bird_bgr: np.ndarray) -> bool:
+    """Detect strong horizontal stop line in bird's-eye view."""
+    gray = cv2.cvtColor(bird_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    roi = gray[int(h * 0.1) : int(h * 0.6), :]
+    blur = cv2.GaussianBlur(roi, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=40,
+        minLineLength=int(w * 0.3),
+        maxLineGap=10,
+    )
+    if lines is None:
+        return False
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        dx, dy = x2 - x1, y2 - y1
+        if dx == 0 and dy == 0:
+            continue
+        ang = abs(np.degrees(np.arctan2(dy, dx)))
+        if ang < 15.0:  # near horizontal
+            return True
+    return False
+
+
+def detect_zebra_crossing(bird_bgr: np.ndarray) -> bool:
+    """Detect repeated white stripes consistent with zebra crossing in bird's-eye view."""
+    h, w = bird_bgr.shape[:2]
+    hsv = cv2.cvtColor(bird_bgr, cv2.COLOR_BGR2HSV)
+    # White-ish regions
+    lower_white = np.array([0, 0, 200], dtype=np.uint8)
+    upper_white = np.array([180, 60, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+    band = mask[int(h * 0.1) : int(h * 0.6), :]
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(
+        band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    stripe_count = 0
+    area_min = (w * h) * 0.0002
+    area_max = (w * h) * 0.05
+    for cnt in contours:
+        x, y, ww, hh = cv2.boundingRect(cnt)
+        area = ww * hh
+        if area < area_min or area > area_max:
+            continue
+        if hh == 0:
+            continue
+        ratio = ww / float(hh)
+        if 2.0 < ratio < 8.0:
+            stripe_count += 1
+    return stripe_count >= 3
+
+
 def _point_segment_distance(px, py, x1, y1, x2, y2):
     """Euclidean distance from point to line segment."""
     vx, vy = x2 - x1, y2 - y1
@@ -128,6 +342,28 @@ def _point_segment_distance(px, py, x1, y1, x2, y2):
     proj_x = x1 + t * vx
     proj_y = y1 + t * vy
     return np.hypot(px - proj_x, py - proj_y)
+
+
+def detect_traffic_poles(line_segments, img_shape):
+    """
+    Heuristic traffic-pole detection: tall near-vertical segments near the junction.
+    Used only to support signalized_intersection classification.
+    """
+    h, w = img_shape[:2]
+    if not line_segments:
+        return False
+    count = 0
+    for x1, y1, x2, y2 in line_segments:
+        dx, dy = x2 - x1, y2 - y1
+        if dx == 0 and dy == 0:
+            continue
+        ang = abs(np.degrees(np.arctan2(dy, dx)))
+        length = np.hypot(dx, dy)
+        if ang > 75.0 and length > h * 0.15:
+            yc = (y1 + y2) / 2.0
+            if h * 0.2 <= yc <= h * 0.9:
+                count += 1
+    return count >= 2
 
 
 def cluster_vehicle_flows(vehicles, line_segments, line_angles_deg):
@@ -259,6 +495,66 @@ def cluster_vehicle_flows(vehicles, line_segments, line_angles_deg):
     return flow_metrics, flows, angles_rad
 
 
+def load_video_frames(path: str, max_frames: int = 10):
+    """Load up to max_frames from a video file. Returns list of BGR frames."""
+    cap = cv2.VideoCapture(str(path))
+    frames = []
+    if not cap.isOpened():
+        return frames
+    while len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+    cap.release()
+    return frames
+
+
+def compute_vehicle_speeds_from_flow(frames_bgr, vehicles):
+    """
+    Compute per-vehicle average motion magnitude using Farneback optical flow.
+    Returns list of normalized speeds in [0, 1] aligned with vehicles list.
+    """
+    if not vehicles or len(frames_bgr) < 2:
+        return [0.0 for _ in vehicles]
+
+    gray_prev = cv2.cvtColor(frames_bgr[0], cv2.COLOR_BGR2GRAY)
+    h, w = gray_prev.shape[:2]
+
+    speeds = np.zeros(len(vehicles), dtype=np.float32)
+    steps = 0
+
+    for frame in frames_bgr[1:]:
+        gray_next = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(
+            gray_prev,
+            gray_next,
+            None,
+            pyr_scale=0.5,
+            levels=3,
+            winsize=15,
+            iterations=3,
+            poly_n=5,
+            poly_sigma=1.2,
+            flags=0,
+        )
+        fh, fw = flow.shape[:2]
+        for idx, v in enumerate(vehicles):
+            cx, cy = v["center"]
+            ix = int(np.clip(cx, 0, fw - 1))
+            iy = int(np.clip(cy, 0, fh - 1))
+            fx, fy = flow[iy, ix]
+            speeds[idx] += np.hypot(fx, fy)
+        steps += 1
+        gray_prev = gray_next
+
+    if steps > 0:
+        speeds /= float(steps)
+    # Normalize: assume ~5 px/frame as "free" motion upper bound
+    norm_speeds = np.clip(speeds / 5.0, 0.0, 1.0)
+    return norm_speeds.tolist()
+
+
 def _rect_intersection_area(r1, r2):
     x1 = max(r1[0], r2[0])
     y1 = max(r1[1], r2[1])
@@ -269,7 +565,9 @@ def _rect_intersection_area(r1, r2):
     return float((x2 - x1) * (y2 - y1))
 
 
-def compute_spillback_metrics(img_shape, vehicles):
+def compute_spillback_metrics(
+    img_shape, vehicles, dominant_direction_deg: float | None = None, vehicle_speeds=None
+):
     """
     Estimate exit clearance, downstream queue, and intersection blockage
     using simple rectangular regions in image space.
@@ -285,19 +583,43 @@ def compute_spillback_metrics(img_shape, vehicles):
             "vehicles_in_conflict_zone": 0,
         }
 
-    # Define regions: exit (top center), intersection (center box)
-    exit_region = (
-        int(w * 0.25),
-        0,
-        int(w * 0.75),
-        int(h * 0.25),
-    )
+    # Define regions: intersection (center box) and a dynamic exit region along dominant flow
     intersection_region = (
         int(w * 0.2),
         int(h * 0.3),
         int(w * 0.8),
         int(h * 0.6),
     )
+    # Dynamic exit region
+    if dominant_direction_deg is None:
+        # Fallback: top-center band
+        exit_region = (
+            int(w * 0.25),
+            0,
+            int(w * 0.75),
+            int(h * 0.25),
+        )
+    else:
+        ang = dominant_direction_deg
+        # Horizontal flow → exit on left or right edge
+        if abs(ang) <= 45.0:
+            # Determine left vs right bias by average vehicle x
+            xs = [v["center"][0] for v in vehicles] if vehicles else [w * 0.5]
+            mean_x = float(np.mean(xs))
+            if mean_x >= w * 0.5:
+                # Flow to the right
+                exit_region = (int(w * 0.7), int(h * 0.2), w, int(h * 0.8))
+            else:
+                # Flow to the left
+                exit_region = (0, int(h * 0.2), int(w * 0.3), int(h * 0.8))
+        else:
+            # Predominantly vertical flow → exit towards top
+            exit_region = (
+                int(w * 0.25),
+                0,
+                int(w * 0.75),
+                int(h * 0.25),
+            )
 
     exit_area = float((exit_region[2] - exit_region[0]) * (exit_region[3] - exit_region[1]))
     inter_area = float(
@@ -308,8 +630,9 @@ def compute_spillback_metrics(img_shape, vehicles):
     inter_occ = 0.0
     exit_centroids_y = []
     conflict_vehicle_count = 0
+    conflict_indices = []
 
-    for v in vehicles:
+    for idx, v in enumerate(vehicles):
         x1, y1, x2, y2 = v["bbox"]
         bbox = (x1, y1, x2, y2)
         exit_occ += _rect_intersection_area(bbox, exit_region)
@@ -322,6 +645,7 @@ def compute_spillback_metrics(img_shape, vehicles):
             and intersection_region[1] <= cy <= intersection_region[3]
         ):
             conflict_vehicle_count += 1
+            conflict_indices.append(idx)
 
     exit_occ_ratio = float(min(1.0, exit_occ / exit_area)) if exit_area > 0 else 0.0
     intersection_blockage_ratio = float(min(1.0, inter_occ / inter_area)) if inter_area > 0 else 0.0
@@ -334,10 +658,15 @@ def compute_spillback_metrics(img_shape, vehicles):
         y_max = max(exit_centroids_y)
         downstream_queue_length = float(max(0.0, y_max - y_min))
 
-    # Conflict stagnation proxy: many vehicles in conflict zone with very low "motion".
-    # Since we only have a single frame, we approximate average motion magnitude
-    # as the free space in the conflict zone: 1 - intersection_blockage_ratio.
-    avg_motion = max(0.0, 1.0 - intersection_blockage_ratio)
+    # Conflict stagnation: prefer real motion from optical flow when available.
+    avg_motion = None
+    if vehicle_speeds is not None and conflict_indices:
+        speeds_conf = [vehicle_speeds[i] for i in conflict_indices]
+        if speeds_conf:
+            avg_motion = float(np.mean(speeds_conf))
+    if avg_motion is None:
+        # Fallback proxy from available free space
+        avg_motion = max(0.0, 1.0 - intersection_blockage_ratio)
     vehicle_count = len(vehicles)
     min_conflict_vehicles = max(3, int(0.15 * vehicle_count)) if vehicle_count > 0 else 0
     stagnation_vehicles = conflict_vehicle_count >= min_conflict_vehicles and conflict_vehicle_count > 0
@@ -346,7 +675,9 @@ def compute_spillback_metrics(img_shape, vehicles):
     conflict_stagnation_score = 0.0
     if conflict_vehicle_count > 0:
         density_factor = min(1.0, conflict_vehicle_count / 10.0)
-        conflict_stagnation_score = float(density_factor * (1.0 - avg_motion))
+        conflict_stagnation_score = float(
+            density_factor * max(0.0, 1.0 - avg_motion)
+        )
 
     spillback_geom = exit_clearance_ratio < 0.3 and intersection_blockage_ratio > 0.3
     spillback_stagnation = stagnation_vehicles and stagnation_low_motion
@@ -376,9 +707,11 @@ def compute_vehicle_density(vehicles, img_shape, road_region_fraction: float = 0
     return float(round(density, 4))
 
 
-def estimate_lane_utilization(vehicles, img_shape, flow_alignment_score: float):
+def estimate_lane_utilization(
+    vehicles, img_shape, flow_alignment_score: float, vanishing_point=None
+):
     """
-    Estimate utilized_lane_count and effective_lane_utilization from vehicle rows.
+    Estimate utilized_lane_count and effective_lane_utilization in a road-aligned frame.
     """
     h, w = img_shape[:2]
     if not vehicles or h <= 0 or w <= 0:
@@ -388,16 +721,31 @@ def estimate_lane_utilization(vehicles, img_shape, flow_alignment_score: float):
             "effective_lane_utilization": 0.0,
         }
 
-    # Use vehicles in lower half (approach region)
-    xs = []
+    # Rotate coordinates so that the road direction is approximately vertical.
+    cx0, cy0 = w * 0.5, float(h)  # origin at bottom center
+    if vanishing_point is not None:
+        vx, vy = vanishing_point
+        angle_dir = np.arctan2(vy - cy0, vx - cx0)
+    else:
+        # Fallback: assume road roughly vertical
+        angle_dir = -np.pi / 2.0
+    theta = -(angle_dir - (-np.pi / 2.0))  # rotation to make road vertical
+
+    xs_rot = []
     for v in vehicles:
         cx, cy = v["center"]
-        if cy >= h * 0.5:
-            xs.append(cx)
-    if not xs:
-        xs = [v["center"][0] for v in vehicles]
+        # Only consider vehicles in lower half as approach
+        if cy < h * 0.5:
+            continue
+        dx = cx - cx0
+        dy = cy - cy0
+        xr = dx * np.cos(theta) - dy * np.sin(theta)
+        xs_rot.append(xr)
 
-    xs_arr = np.array(xs).reshape(-1, 1)
+    if not xs_rot:
+        xs_rot = [v["center"][0] - cx0 for v in vehicles]
+
+    xs_arr = np.array(xs_rot).reshape(-1, 1)
     n = xs_arr.shape[0]
     if n < 2:
         utilized_lane_count = 1
@@ -411,7 +759,9 @@ def estimate_lane_utilization(vehicles, img_shape, flow_alignment_score: float):
         if utilized_lane_count == 0:
             utilized_lane_count = 1
 
-    potential_lanes = max(1, min(6, int(w / 200)))
+    # Effective number of lanes allowed by width in rotated frame
+    width_est = max(xs_rot) - min(xs_rot) if xs_rot else w
+    potential_lanes = max(1, min(6, int(abs(width_est) / 200.0))) if width_est != 0 else 1
     effective_lane_utilization = float(
         min(1.0, utilized_lane_count / float(potential_lanes))
     )
@@ -483,6 +833,43 @@ def classify_scene_type(
     return "arterial_corridor"
 
 
+def compute_lane_discipline_score(vehicles, per_vehicle_angles_rad):
+    """
+    Mixed-traffic lane discipline heuristic in [0, 1].
+    Lower when many vehicles, especially two-wheelers, deviate diagonally from main flow.
+    """
+    if not vehicles or not per_vehicle_angles_rad:
+        return 1.0
+
+    angs = np.array(per_vehicle_angles_rad, dtype=np.float32)
+    # Main flow direction
+    main_dir = float(np.median(angs))
+
+    def wrapped_delta(a):
+        d = abs(a - main_dir)
+        d = min(d, np.pi - d)
+        return d
+
+    deltas = np.array([wrapped_delta(a) for a in angs], dtype=np.float32)
+    # Normalize by 45 degrees
+    overall_alignment = float(max(0.0, 1.0 - (deltas.mean() / (np.pi / 4.0))))
+
+    # Two-wheelers (bicycle + motorcycle)
+    two_idx = [
+        i
+        for i, v in enumerate(vehicles)
+        if v["class_id"] in {1, 3}
+    ]
+    if two_idx:
+        deltas_two = deltas[two_idx]
+        two_alignment = float(max(0.0, 1.0 - (deltas_two.mean() / (np.pi / 4.0))))
+    else:
+        two_alignment = overall_alignment
+
+    lane_discipline = 0.5 * overall_alignment + 0.5 * two_alignment
+    return float(max(0.0, min(1.0, lane_discipline)))
+
+
 def classify_choke(
     scene_type: str,
     spillback_flag: bool,
@@ -492,51 +879,54 @@ def classify_choke(
     intersection_blockage_ratio: float,
     effective_lane_utilization: float,
     conflict_stagnation_score: float,
+    signal_present: bool,
 ):
     """
-    Priority-based choke classification with severity aligned to blockage and conflicts.
+    Priority-based choke classification with sigmoid severity model.
     Types:
-      - structural_geometry
-      - spillback_congestion
+      - signal_noncompliance_gridlock
       - behavioral_gridlock
+      - spillback_congestion
+      - structural_geometry
       - demand_surge
     """
     reasons = []
 
     structural_geometry_flag = effective_lane_utilization < 0.5 and vehicle_density > 0.5
 
-    # Priority hierarchy:
-    # 1) Severe conflict-zone blockage
-    if intersection_blockage_ratio > 0.7:
+    # Priority hierarchy from specification
+    if intersection_blockage_ratio > 0.7 and signal_present:
+        choke_type = "signal_noncompliance_gridlock"
+    elif intersection_blockage_ratio > 0.7:
         choke_type = "behavioral_gridlock"
-    # 2) Downstream spillback into the node
     elif spillback_flag:
         choke_type = "spillback_congestion"
-    # 3) Constrained geometry under demand
     elif structural_geometry_flag:
         choke_type = "structural_geometry"
-    # 4) Residual high loading
     else:
         choke_type = "demand_surge"
 
-    # Unified choke severity score
-    score = (
-        0.4 * intersection_blockage_ratio
-        + 0.2 * vehicle_density
-        + 0.2 * (1.0 - flow_alignment_score)
-        + 0.2 * max(0.0, min(1.0, conflict_stagnation_score))
+    # Sigmoid-based choke score
+    z = (
+        2.0 * intersection_blockage_ratio
+        + 1.5 * max(0.0, min(1.0, conflict_stagnation_score))
+        + 1.0 * vehicle_density
+        + 1.0 * (1.0 - flow_alignment_score)
     )
-    score = float(max(0.0, min(1.0, score)))
-    if intersection_blockage_ratio > 0.8 and score < 0.75:
-        score = 0.75
+    score = float(1.0 / (1.0 + float(np.exp(-z))))
 
     # Diagnosis text per choke type
-    if choke_type == "behavioral_gridlock":
+    if choke_type == "signal_noncompliance_gridlock":
+        reasons.append(
+            "Severe blocking of the signalized conflict zone with vehicles occupying the box despite limited exit clearance."
+        )
+        reasons.append(
+            "Likely signal non-compliance or insufficient red-clear time causing standing queues across the stop line."
+        )
+    elif choke_type == "behavioral_gridlock":
         reasons.append(
             "Conflict zone is heavily blocked with simultaneous cross-direction occupancy and poor exit clearance."
         )
-        if intersection_blockage_ratio > 0.9:
-            reasons.append("Intersection is almost fully occupied (blockage ratio close to 1.0).")
     elif choke_type == "spillback_congestion":
         reasons.append(
             "Downstream queues appear to spill back into the junction, restricting exit lanes and discharge."
@@ -551,7 +941,12 @@ def classify_choke(
         )
     diagnosis = " ".join(reasons)
 
-    if choke_type == "spillback_congestion":
+    if choke_type == "signal_noncompliance_gridlock":
+        suggested_fix = (
+            "Review and enforce signal compliance, introduce box markings and all-red or clearance intervals, "
+            "and coordinate upstream signals to prevent vehicles entering the junction without downstream space."
+        )
+    elif choke_type == "spillback_congestion":
         suggested_fix = (
             "Increase downstream discharge capacity or storage, protect exit lanes, and "
             "apply signal or metering control upstream to prevent queues blocking the junction."
@@ -597,6 +992,7 @@ def render_overlay(
     choke_score: float,
     intersection_blockage_ratio: float,
     exit_clearance_ratio: float,
+    signal_detected: bool,
 ):
     """
     Draw a clean, minimal overlay:
@@ -642,6 +1038,7 @@ def render_overlay(
     label1 = f"Scene: {scene_type}"
     label2 = f"Choke: {choke_type}"
     label3 = f"Score: {choke_score:.2f}"
+    label4 = f"Signal: {'Yes' if signal_detected else 'No'}"
 
     def draw_label(text, y):
         (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
@@ -651,6 +1048,14 @@ def render_overlay(
     draw_label(label1, 25)
     draw_label(label2, 50)
     draw_label(label3, 75)
+    draw_label(label4, 100)
+
+    # Small signal indicator icon in top-right
+    icon_center = (w - 30, 30)
+    radius = 10
+    color_on = (0, 255, 0)
+    color_off = (128, 128, 128)
+    cv2.circle(out, icon_center, radius, color_on if signal_detected else color_off, -1)
 
     return out
 
@@ -659,7 +1064,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Scene-aware traffic choke detection from a single road image."
     )
-    parser.add_argument("image_path", type=str, help="Path to input road image")
+    parser.add_argument("image_path", type=str, help="Path to input road image or video")
     parser.add_argument(
         "--model",
         type=str,
@@ -671,9 +1076,33 @@ def main():
         action="store_true",
         help="Skip interactive window display (still saves annotated image).",
     )
+    parser.add_argument(
+        "--video",
+        action="store_true",
+        help="Interpret image_path as video and use multiple frames for optical flow.",
+    )
+    parser.add_argument(
+        "--max-video-frames",
+        type=int,
+        default=8,
+        help="Maximum number of frames to read from video (default: 8).",
+    )
     args = parser.parse_args()
 
-    img = load_image(args.image_path)
+    # Media loading (single frame or short clip)
+    if args.video:
+        frames_bgr = load_video_frames(args.image_path, max_frames=args.max_video_frames)
+        if not frames_bgr:
+            print(
+                json.dumps({"error": f"Could not read video: {args.image_path}"}),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        img = frames_bgr[0]
+    else:
+        img = load_image(args.image_path)
+        frames_bgr = [img]
+
     model = YOLO(args.model)
 
     # STEP 1 & 2: detections, lane lines, and flow clustering
@@ -685,17 +1114,52 @@ def main():
         vehicles, line_segments, line_angles_deg
     )
 
-    # STEP 3: Spillback metrics
-    spillback_metrics = compute_spillback_metrics(img.shape, vehicles)
-
-    # STEP 4: Lane utilization (using flow alignment as lane_alignment_score)
-    vehicle_density = compute_vehicle_density(vehicles, img.shape)
-    lane_metrics = estimate_lane_utilization(
-        vehicles, img.shape, flow_metrics["flow_alignment_score"]
+    # Enhanced traffic signal detection (multi-scale)
+    traffic_signal_detected, signal_confidence = detect_traffic_signals_multi_scale(
+        model, img
     )
 
-    # STEP 1 (scene) – using flows + blockage + signals
-    traffic_signal_present = bool(signals)
+    # Optional traffic pole heuristic to support signalized scene classification
+    traffic_pole_present = detect_traffic_poles(line_segments, img.shape)
+
+    # Vanishing point for perspective-aware geometry
+    vanishing_point = estimate_vanishing_point(line_segments, img.shape)
+
+    # Optional temporal intelligence via optical flow
+    vehicle_speeds = compute_vehicle_speeds_from_flow(frames_bgr, vehicles)
+    dominant_direction_deg = None
+    if flows:
+        dominant_direction_deg = sorted(
+            flows, key=lambda x: x["vehicle_count"], reverse=True
+        )[0]["direction_deg"]
+
+    # STEP 3: Spillback metrics (dynamic exit + real motion if available)
+    spillback_metrics = compute_spillback_metrics(
+        img.shape,
+        vehicles,
+        dominant_direction_deg=dominant_direction_deg,
+        vehicle_speeds=vehicle_speeds,
+    )
+
+    # STEP 4: Lane utilization (using perspective-aware clustering)
+    vehicle_density = compute_vehicle_density(vehicles, img.shape)
+    lane_metrics = estimate_lane_utilization(
+        vehicles,
+        img.shape,
+        flow_metrics["flow_alignment_score"],
+        vanishing_point=vanishing_point,
+    )
+    lane_discipline_score = compute_lane_discipline_score(
+        vehicles, per_vehicle_angles_rad
+    )
+
+    # Infrastructure-aware elements (stop line, zebra crossing)
+    bird_view, _ = compute_birds_eye_view(img)
+    stop_line_detected = detect_stop_line(bird_view)
+    zebra_crossing_detected = detect_zebra_crossing(bird_view)
+
+    # STEP 1 (scene) – using flows + blockage + confirmed signals/poles
+    traffic_signal_present = bool(traffic_signal_detected or traffic_pole_present)
     scene_type = classify_scene_type(
         line_angles_deg=line_angles_deg,
         dominant_flow_count=flow_metrics["dominant_flow_count"],
@@ -716,6 +1180,7 @@ def main():
         intersection_blockage_ratio=spillback_metrics["intersection_blockage_ratio"],
         effective_lane_utilization=lane_metrics["effective_lane_utilization"],
         conflict_stagnation_score=spillback_metrics["conflict_stagnation_score"],
+        signal_present=traffic_signal_present,
     )
 
     # STEP 6: Visualization – clean overlay only
@@ -728,6 +1193,7 @@ def main():
         choke_score=choke_score,
         intersection_blockage_ratio=spillback_metrics["intersection_blockage_ratio"],
         exit_clearance_ratio=spillback_metrics["exit_clearance_ratio"],
+        signal_detected=traffic_signal_detected,
     )
 
     # STEP 7: Structured JSON output
@@ -749,6 +1215,12 @@ def main():
             round(spillback_metrics["intersection_blockage_ratio"], 3)
         ),
         "flow_alignment_score": float(round(flow_metrics["flow_alignment_score"], 3)),
+        "vehicle_density": float(vehicle_density),
+        "lane_discipline_score": float(round(lane_discipline_score, 3)),
+        "traffic_signal_detected": bool(traffic_signal_detected),
+        "stop_line_detected": bool(stop_line_detected),
+        "zebra_crossing_detected": bool(zebra_crossing_detected),
+        "signal_confidence": float(round(signal_confidence, 3)),
         "diagnosis": diagnosis,
         "suggested_fix": suggested_fix,
     }
